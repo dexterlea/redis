@@ -35,6 +35,7 @@ set ::all_tests {
     unit/quit
     unit/aofrw
     unit/acl
+    unit/latency-monitor
     integration/block-repl
     integration/replication
     integration/replication-2
@@ -48,6 +49,7 @@ set ::all_tests {
     integration/psync2
     integration/psync2-reg
     integration/psync2-pingoff
+    integration/redis-cli
     unit/pubsub
     unit/slowlog
     unit/scripting
@@ -193,6 +195,21 @@ proc redis_deferring_client {args} {
     # select the right db and read the response (OK)
     $client select 9
     $client read
+    return $client
+}
+
+proc redis_client {args} {
+    set level 0
+    if {[llength $args] > 0 && [string is integer [lindex $args 0]]} {
+        set level [lindex $args 0]
+        set args [lrange $args 1 end]
+    }
+
+    # create client that defers reading reply
+    set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls]
+
+    # select the right db and read the response (OK)
+    $client select 9
     return $client
 }
 
@@ -342,8 +359,8 @@ proc read_from_test_client fd {
         puts $err
         lappend ::failed_tests $err
         set ::active_clients_task($fd) "(ERR) $data"
-            if {$::stop_on_failure} {
-            puts -nonewline "(Test stopped, press enter to continue)"
+        if {$::stop_on_failure} {
+            puts -nonewline "(Test stopped, press enter to resume the tests)"
             flush stdout
             gets stdin
         }
