@@ -1,4 +1,4 @@
-/* Redis benchmark utility.
+/* Redis benchmark utility. 
  *
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
@@ -183,8 +183,6 @@ static void *execBenchmarkThread(void *ptr);
 static clusterNode *createClusterNode(char *ip, int port);
 static redisConfig *getRedisConfig(const char *ip, int port,
                                    const char *hostsocket);
-static redisContext *getRedisContext(const char *ip, int port,
-                                     const char *hostsocket);
 static void freeRedisConfig(redisConfig *cfg);
 static int fetchClusterSlotsConfiguration(client c);
 static void updateClusterSlotsConfiguration();
@@ -240,52 +238,6 @@ void _serverAssert(const char *estr, const char *file, int line) {
     *((char*)-1) = 'x';
 }
 
-static redisContext *getRedisContext(const char *ip, int port,
-                                     const char *hostsocket)
-{
-    redisContext *ctx = NULL;
-    redisReply *reply =  NULL;
-    if (hostsocket == NULL)
-        ctx = redisConnect(ip, port);
-    else
-        ctx = redisConnectUnix(hostsocket);
-    if (ctx == NULL || ctx->err) {
-        fprintf(stderr,"Could not connect to Redis at ");
-        char *err = (ctx != NULL ? ctx->errstr : "");
-        if (hostsocket == NULL)
-            fprintf(stderr,"%s:%d: %s\n",ip,port,err);
-        else
-            fprintf(stderr,"%s: %s\n",hostsocket,err);
-        goto cleanup;
-    }
-    if (config.auth == NULL)
-        return ctx;
-    if (config.user == NULL)
-        reply = redisCommand(ctx,"AUTH %s", config.auth);
-    else
-        reply = redisCommand(ctx,"AUTH %s %s", config.user, config.auth);
-    if (reply != NULL) {
-        if (reply->type == REDIS_REPLY_ERROR) {
-            if (hostsocket == NULL)
-                fprintf(stderr, "Node %s:%d replied with error:\n%s\n", ip, port, reply->str);
-            else
-                fprintf(stderr, "Node %s replied with error:\n%s\n", hostsocket, reply->str);
-            goto cleanup;
-        }
-        freeReplyObject(reply);
-        return ctx;
-    }
-    fprintf(stderr, "ERROR: failed to fetch reply from ");
-    if (hostsocket == NULL)
-        fprintf(stderr, "%s:%d\n", ip, port);
-    else
-        fprintf(stderr, "%s\n", hostsocket);
-cleanup:
-    freeReplyObject(reply);
-    redisFree(ctx);
-    return NULL;
-}
-
 static redisConfig *getRedisConfig(const char *ip, int port,
                                    const char *hostsocket)
 {
@@ -293,11 +245,33 @@ static redisConfig *getRedisConfig(const char *ip, int port,
     if (!cfg) return NULL;
     redisContext *c = NULL;
     redisReply *reply = NULL, *sub_reply = NULL;
-    c = getRedisContext(ip, port, hostsocket);
-    if (c == NULL) {
-        freeRedisConfig(cfg);
-        return NULL;
+    if (hostsocket == NULL)
+        c = redisConnect(ip, port);
+    else
+        c = redisConnectUnix(hostsocket);
+    if (c == NULL || c->err) {
+        fprintf(stderr,"Could not connect to Redis at ");
+        char *err = (c != NULL ? c->errstr : "");
+        if (hostsocket == NULL) fprintf(stderr,"%s:%d: %s\n",ip,port,err);
+        else fprintf(stderr,"%s: %s\n",hostsocket,err);
+        goto fail;
     }
+
+    if(config.auth) {
+        void *authReply = NULL;
+        if (config.user == NULL)
+            redisAppendCommand(c, "AUTH %s", config.auth);
+        else
+            redisAppendCommand(c, "AUTH %s %s", config.user, config.auth);
+        if (REDIS_OK != redisGetReply(c, &authReply)) goto fail;
+        if (reply) freeReplyObject(reply);
+        reply = ((redisReply *) authReply);
+        if (reply->type == REDIS_REPLY_ERROR) {
+            fprintf(stderr, "ERROR: %s\n", reply->str);
+            goto fail;
+        }
+    }
+
     redisAppendCommand(c, "CONFIG GET %s", "save");
     redisAppendCommand(c, "CONFIG GET %s", "appendonly");
     int i = 0;
@@ -1020,8 +994,16 @@ static int fetchClusterConfiguration() {
     int success = 1;
     redisContext *ctx = NULL;
     redisReply *reply =  NULL;
-    ctx = getRedisContext(config.hostip, config.hostport, config.hostsocket);
-    if (ctx == NULL) {
+    if (config.hostsocket == NULL)
+        ctx = redisConnect(config.hostip,config.hostport);
+    else
+        ctx = redisConnectUnix(config.hostsocket);
+    if (ctx->err) {
+        fprintf(stderr,"Could not connect to Redis at ");
+        if (config.hostsocket == NULL) {
+            fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,
+                    ctx->errstr);
+        } else fprintf(stderr,"%s: %s\n",config.hostsocket,ctx->errstr);
         exit(1);
     }
     clusterNode *firstNode = createClusterNode((char *) config.hostip,
@@ -1217,9 +1199,11 @@ static int fetchClusterSlotsConfiguration(client c) {
         assert(node->port);
         /* Use first node as entry point to connect to. */
         if (ctx == NULL) {
-            ctx = getRedisContext(node->ip, node->port, NULL);
-            if (!ctx) {
+            ctx = redisConnect(node->ip, node->port);
+            if (!ctx || ctx->err) {
                 success = 0;
+                if (ctx && ctx->err)
+                    fprintf(stderr, "REDIS CONNECTION ERROR: %s\n", ctx->errstr);
                 goto cleanup;
             }
         }

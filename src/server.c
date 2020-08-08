@@ -3402,34 +3402,6 @@ void call(client *c, int flags) {
     server.stat_numcommands++;
 }
 
-/* Used when a command that is ready for execution needs to be rejected, due to
- * varios pre-execution checks. it returns the appropriate error to the client.
- * If there's a transaction is flags it as dirty, and if the command is EXEC,
- * it aborts the transaction. */
-void rejectCommand(client *c, robj *reply) {
-    flagTransaction(c);
-    if (c->cmd && c->cmd->proc == execCommand) {
-        execCommandAbort(c, reply->ptr);
-    } else {
-        /* using addReplyError* rather than addReply so that the error can be logged. */
-        addReplyErrorSafe(c, reply->ptr, sdslen(reply->ptr));
-    }
-}
-
-void rejectCommandFormat(client *c, const char *fmt, ...) {
-    flagTransaction(c);
-    va_list ap;
-    va_start(ap,fmt);
-    sds s = sdscatvprintf(sdsempty(),fmt,ap);
-    va_end(ap);
-    if (c->cmd && c->cmd->proc == execCommand) {
-        execCommandAbort(c, s);
-    } else {
-        addReplyErrorSafe(c, s, sdslen(s));
-    }
-    sdsfree(s);
-}
-
 /* If this function gets called we already read a whole
  * command, arguments are in the client argv/argc fields.
  * processCommand() execute the command or prepare the
@@ -3455,29 +3427,22 @@ int processCommand(client *c) {
      * such as wrong arity, bad command name and so forth. */
     c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
     if (!c->cmd) {
+        flagTransaction(c);
         sds args = sdsempty();
         int i;
         for (i=1; i < c->argc && sdslen(args) < 128; i++)
             args = sdscatprintf(args, "`%.*s`, ", 128-(int)sdslen(args), (char*)c->argv[i]->ptr);
-        rejectCommandFormat(c,"unknown command `%s`, with args beginning with: %s",
+        addReplyErrorFormat(c,"unknown command `%s`, with args beginning with: %s",
             (char*)c->argv[0]->ptr, args);
         sdsfree(args);
         return C_OK;
     } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
                (c->argc < -c->cmd->arity)) {
-        rejectCommandFormat(c,"wrong number of arguments for '%s' command",
+        flagTransaction(c);
+        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
             c->cmd->name);
         return C_OK;
     }
-
-    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
-                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
-    int is_denyoom_command = (c->cmd->flags & CMD_DENYOOM) ||
-                             (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_DENYOOM));
-    int is_denystale_command = !(c->cmd->flags & CMD_STALE) ||
-                               (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_STALE));
-    int is_denyloading_command = !(c->cmd->flags & CMD_LOADING) ||
-                                 (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_LOADING));
 
     /* Check if the user is authenticated. This check is skipped in case
      * the default user is flagged as "nopass" and is active. */
@@ -3488,7 +3453,8 @@ int processCommand(client *c) {
         /* AUTH and HELLO and no auth modules are valid even in
          * non-authenticated state. */
         if (!(c->cmd->flags & CMD_NO_AUTH)) {
-            rejectCommand(c,shared.noautherr);
+            flagTransaction(c);
+            addReply(c,shared.noautherr);
             return C_OK;
         }
     }
@@ -3499,12 +3465,13 @@ int processCommand(client *c) {
     int acl_retval = ACLCheckCommandPerm(c,&acl_keypos);
     if (acl_retval != ACL_OK) {
         addACLLogEntry(c,acl_retval,acl_keypos,NULL);
+        flagTransaction(c);
         if (acl_retval == ACL_DENIED_CMD)
-            rejectCommandFormat(c,
+            addReplyErrorFormat(c,
                 "-NOPERM this user has no permissions to run "
                 "the '%s' command or its subcommand", c->cmd->name);
         else
-            rejectCommandFormat(c,
+            addReplyErrorFormat(c,
                 "-NOPERM this user has no permissions to access "
                 "one of the keys used as arguments");
         return C_OK;
@@ -3552,11 +3519,13 @@ int processCommand(client *c) {
          * is trying to execute is denied during OOM conditions or the client
          * is in MULTI/EXEC context? Error. */
         if (out_of_memory &&
-            (is_denyoom_command ||
+            (c->cmd->flags & CMD_DENYOOM ||
              (c->flags & CLIENT_MULTI &&
+              c->cmd->proc != execCommand &&
               c->cmd->proc != discardCommand)))
         {
-            rejectCommand(c, shared.oomerr);
+            flagTransaction(c);
+            addReply(c, shared.oomerr);
             return C_OK;
         }
 
@@ -3577,14 +3546,17 @@ int processCommand(client *c) {
     int deny_write_type = writeCommandsDeniedByDiskError();
     if (deny_write_type != DISK_ERROR_TYPE_NONE &&
         server.masterhost == NULL &&
-        (is_write_command ||c->cmd->proc == pingCommand))
+        (c->cmd->flags & CMD_WRITE ||
+         c->cmd->proc == pingCommand))
     {
+        flagTransaction(c);
         if (deny_write_type == DISK_ERROR_TYPE_RDB)
-            rejectCommand(c, shared.bgsaveerr);
+            addReply(c, shared.bgsaveerr);
         else
-            rejectCommandFormat(c,
+            addReplySds(c,
+                sdscatprintf(sdsempty(),
                 "-MISCONF Errors writing to the AOF file: %s\r\n",
-                strerror(server.aof_last_write_errno));
+                strerror(server.aof_last_write_errno)));
         return C_OK;
     }
 
@@ -3593,10 +3565,11 @@ int processCommand(client *c) {
     if (server.masterhost == NULL &&
         server.repl_min_slaves_to_write &&
         server.repl_min_slaves_max_lag &&
-        is_write_command &&
+        c->cmd->flags & CMD_WRITE &&
         server.repl_good_slaves_count < server.repl_min_slaves_to_write)
     {
-        rejectCommand(c, shared.noreplicaserr);
+        flagTransaction(c);
+        addReply(c, shared.noreplicaserr);
         return C_OK;
     }
 
@@ -3604,9 +3577,10 @@ int processCommand(client *c) {
      * accept write commands if this is our master. */
     if (server.masterhost && server.repl_slave_ro &&
         !(c->flags & CLIENT_MASTER) &&
-        is_write_command)
+        c->cmd->flags & CMD_WRITE)
     {
-        rejectCommand(c, shared.roslaveerr);
+        flagTransaction(c);
+        addReply(c, shared.roslaveerr);
         return C_OK;
     }
 
@@ -3618,7 +3592,7 @@ int processCommand(client *c) {
         c->cmd->proc != unsubscribeCommand &&
         c->cmd->proc != psubscribeCommand &&
         c->cmd->proc != punsubscribeCommand) {
-        rejectCommandFormat(c,
+        addReplyErrorFormat(c,
             "Can't execute '%s': only (P)SUBSCRIBE / "
             "(P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
             c->cmd->name);
@@ -3630,16 +3604,17 @@ int processCommand(client *c) {
      * link with master. */
     if (server.masterhost && server.repl_state != REPL_STATE_CONNECTED &&
         server.repl_serve_stale_data == 0 &&
-        is_denystale_command)
+        !(c->cmd->flags & CMD_STALE))
     {
-        rejectCommand(c, shared.masterdownerr);
+        flagTransaction(c);
+        addReply(c, shared.masterdownerr);
         return C_OK;
     }
 
     /* Loading DB? Return an error if the command has not the
      * CMD_LOADING flag. */
-    if (server.loading && is_denyloading_command) {
-        rejectCommand(c, shared.loadingerr);
+    if (server.loading && !(c->cmd->flags & CMD_LOADING)) {
+        addReply(c, shared.loadingerr);
         return C_OK;
     }
 
@@ -3654,6 +3629,7 @@ int processCommand(client *c) {
           c->cmd->proc != helloCommand &&
           c->cmd->proc != replconfCommand &&
           c->cmd->proc != multiCommand &&
+          c->cmd->proc != execCommand &&
           c->cmd->proc != discardCommand &&
           c->cmd->proc != watchCommand &&
           c->cmd->proc != unwatchCommand &&
@@ -3664,7 +3640,8 @@ int processCommand(client *c) {
           c->argc == 2 &&
           tolower(((char*)c->argv[1]->ptr)[0]) == 'k'))
     {
-        rejectCommand(c, shared.slowscripterr);
+        flagTransaction(c);
+        addReply(c, shared.slowscripterr);
         return C_OK;
     }
 
@@ -3703,15 +3680,6 @@ void closeListeningSockets(int unlink_unix_socket) {
 }
 
 int prepareForShutdown(int flags) {
-    /* When SHUTDOWN is called while the server is loading a dataset in
-     * memory we need to make sure no attempt is performed to save
-     * the dataset on shutdown (otherwise it could overwrite the current DB
-     * with half-read data).
-     *
-     * Also when in Sentinel mode clear the SAVE flag and force NOSAVE. */
-    if (server.loading || server.sentinel_mode)
-        flags = (flags & ~SHUTDOWN_SAVE) | SHUTDOWN_NOSAVE;
-
     int save = flags & SHUTDOWN_SAVE;
     int nosave = flags & SHUTDOWN_NOSAVE;
 
